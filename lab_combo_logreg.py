@@ -783,7 +783,7 @@ def _feature_cols_from_index(
 
 
 def _combo_task_lite(
-    df_loc: pd.DataFrame,
+    df_parts: List[pd.DataFrame],   # было: df_loc: pd.DataFrame
     month: int,
     test_combo: Tuple[str, ...],
     combo_index: int,
@@ -808,6 +808,7 @@ def _combo_task_lite(
                      отправки задачи; модели ниже порога уже не могут
                      попасть в итоговый top-N, поэтому не пересылаются).
     """
+    df_loc = pd.concat(df_parts, ignore_index=True)
     empty_hist = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64))
     empty_recs = np.empty(0, dtype=LITE_DTYPE)
 
@@ -1068,7 +1069,7 @@ def _plain_model_record(record: ModelRecord, balanced_df: pd.DataFrame) -> dict:
 
 
 def _combo_task_refit(
-    df_loc: pd.DataFrame,
+    df_parts: List[pd.DataFrame],
     month: int,
     test_combo: Tuple[str, ...],
     winners: List[Tuple[Tuple[str, ...], Tuple[float, float, Tuple[float, ...], int, int]]],
@@ -1083,6 +1084,7 @@ def _combo_task_refit(
     winners = [(feature_cols, stat из Phase 1)], сплиты заново не считаются.
     Возвращает уже запиклленные записи (главный процесс только дописывает
     их байты в .pkl - это эквивалентно pickle.dump по одной) и их accuracy."""
+    df_loc = pd.concat(df_parts, ignore_index=True)
 
     rng = np.random.default_rng(seed)
 
@@ -1298,10 +1300,7 @@ def build_top_models(
             # отправки - воркер сам отбрасывает заведомо проигравшие модели.
             jobs = (
                 delayed(_combo_task_lite)(
-                    pd.concat(
-                        [by_test[t] for t in combo],
-                        ignore_index=True,
-                    ),
+                    [by_test[t] for t in combo],
                     month,
                     combo,
                     i,
@@ -1320,6 +1319,7 @@ def build_top_models(
             parallel = Parallel(
                 n_jobs=n_jobs,
                 return_as="generator_unordered",
+                max_nbytes=None
             )
 
             for _m, _nf, _tried, n_valid, (h_vals, h_counts), recs in tqdm(
@@ -1431,10 +1431,7 @@ def build_top_models(
 
             refit_jobs = (
                 delayed(_combo_task_refit)(
-                    pd.concat(
-                        [by_test[t] for t in combos[combo_index]],
-                        ignore_index=True,
-                    ),
+                    [by_test[t] for t in combos[combo_index]],
                     month,
                     combos[combo_index],
                     combo_winners,
@@ -1456,6 +1453,7 @@ def build_top_models(
             refit_parallel = Parallel(
                 n_jobs=n_jobs,
                 return_as="generator",
+                max_nbytes=None
             )
 
             with open(out_path, "wb") as out_f:
