@@ -1,134 +1,3 @@
-"""
-Поиск логистических регрессий по комбинациям ЛАБОРАТОРНЫХ ТЕСТОВ на
-ОДНОМ сыром ("длинном") датасете.
-
-На вход подаётся ОДИН сырой файл вида:
-
-    index  test_id  patient_id  test_type_code  test_date  test_result
-    value_unit_code  birth_date  gender  death_date  death_reason
-    max_date  diag_code  morph_group_name  diag_metastases_localization
-    days_to_death  target
-
-(1 строка = 1 измерение одного лабораторного теста у одного пациента).
-
-ЧТО СЧИТАЕТСЯ "КОМБИНАЦИЕЙ ПРИЗНАКОВ" (n_features):
-n_features - это количество РАЗНЫХ ЛАБОРАТОРНЫХ ТЕСТОВ (test_type_code),
-участвующих в модели. Каждый признак модели ОБЯЗАТЕЛЬНО берётся из
-СВОЕГО, ОТДЕЛЬНОГО теста.
-
-ГЛОБАЛЬНЫЕ ПЕРЦЕНТИЛИ: Перцентиль считается ОДИН РАЗ
-для всего сырого ("длинного") датасета - см. add_global_percentiles():
-каждому измерению (1 строка = 1 измерение) сопоставляется его
-перцентильный ранг (0..1) относительно ВСЕГО распределения измерений
-ЭТОГО ЖЕ теста по всей популяции и по ВСЕМУ времени наблюдения (в том
-числе относительно измерений, случившихся позже, "в будущем. Эта колонка (test_result_percentile)
-затем агрегируется в окне 30 дней ТАК ЖЕ, как и абсолютное значение теста
-(test_result): mean/q25/median/q75 за окно - см.
-feature_engineering(). Итого на каждый тест комбинации приходится
-8 кандидатов-столбцов (4 по абсолютному значению + 4 по перцентилю).
-
-Для каждой комбинации тестов (test_combo) размера n_features и каждого
-"месяца" (n_month = 1..6, окно наблюдения) препроцессинг строится ЗАНОВО
-из сырых данных:
-  1. timing()               - парсинг дат, пересчёт target по death_date,
-                               чистка нулевых test_result, кодирование пола.
-  2. add_global_percentiles() - см. выше; делается ОДИН РАЗ для всего
-                               датасета, а не заново для каждой комбинации.
-  3. feature_engineering()   - для тестов из test_combo строит widetable
-                               (1 строка = 1 пациент)
-                               window-статистиками по test_result и по
-                               test_result_percentile. Пропуски (NaN)
-                               сохраняются как есть - нужный dropna()
-                               делается позже, в fit_combo_model()/
-                               fit_combo_accuracy_only(), СТРОГО по тем
-                               колонкам, которые реально входят в
-                               конкретный набор feature_cols модели.
-
-Дальше для этой же widetable перебираются ВСЕ способы выбрать РОВНО ПО
-ОДНОЙ конкретной статистике из каждого теста комбинации (декартово
-произведение кандидатов по тестам, 8^n_features вариантов). Для каждого
-такого набора из n_features колонок отдельно:
-  - dropna() СТРОГО по этим n_features колонкам (+ target);
-  - балансировка классов 1:1 (undersampling);
-  - обучение и оценка на нескольких РАЗНЫХ train/test-разбиениях одного и
-    того же сбалансированного датасета (SPLIT_RANDOM_STATES); итоговая
-    accuracy модели - среднее accuracy по этим разбиениям (плюс std и
-    отдельные accuracy по каждому разбиению - для контроля устойчивости);
-  - комбинации с недостаточным числом строк ПОСЛЕ балансировки (см.
-    MIN_SAMPLES) отбрасываются как статистически ненадёжные.
-
-ОТБОР И ХРАНЕНИЕ РЕЗУЛЬТАТОВ (потоковый top-N%, одна проходка, без диска):
-Сохраняется top_fraction лучших моделей (по умолчанию 10%) на пару
-(месяц, n_features) - либо фиксированный top_count при --top-mode count.
-При n_features=3-4 число моделей (комбинации тестов x 8^n_features
-наборов статистик) огромно, поэтому отбор устроен в ДВЕ ФАЗЫ (см.
-build_top_models()):
-
-  Phase 1 ("lite"): для каждой (месяц, test_combo) строится widetable
-    один раз, и для каждого набора статистик считается ТОЛЬКО accuracy
-    (среднее по SPLIT_RANDOM_STATES - эти 10 разбиений НЕ являются
-    отдельными моделями). Воркер возвращает не список словарей, а
-    КОМПАКТНЫЙ numpy-массив записей (LITE_DTYPE, ~130 байт на модель:
-    индекс комбинации, индекс набора статистик, accuracy, std, accuracy
-    по разбиениям, n_train, n_test) - имена колонок не хранятся, а
-    восстанавливаются по индексу набора (порядок itertools.product).
-
-    Записи проходят через StreamingTopK - ограниченный буфер top-K:
-      * ёмкость K - верхняя граница числа победителей: при fraction
-        K = ceil(top_fraction * C(T, n_features) * 8^n_features), т.е.
-        от КОМБИНАТОРНОГО числа моделей (все модели валидны в худшем
-        случае); по ходу перебора K уменьшается до
-        ceil(top_fraction * (валидных_уже + ещё_не_посчитанных)) - так
-        невалидные (min_samples и т.п.) модели не раздувают буфер;
-      * когда буфер переполнен (K + запас), он сжимается векторно
-        (np.lexsort) до K лучших, и порог threshold = accuracy K-й
-        модели; записи с accuracy < threshold дальше отбрасываются
-        сразу - в т.ч. ещё в воркере (порог передаётся в новые задачи),
-        чтобы не гонять их через межпроцессный pickle;
-      * порядок полностью детерминирован: accuracy (округлённая до
-        ACC_KEY_DECIMALS знаков - чтобы одинаковые доли k/n_test,
-        посчитанные с разным порядком суммирования, были ничьей) по
-        убыванию, затем combo_index, затем индекс набора статистик.
-        Результат не зависит ни от --n-jobs, ни от порядка прихода задач.
-    Итог: после Phase 1 буфер ГАРАНТИРОВАННО содержит точный top-N, где
-    N = max(1, round(top_fraction * число_валидных_моделей)) (или
-    min(top_count, число_валидных)). Никакого временного файла и
-    повторного чтения, в памяти не больше ~2.5*K компактных записей.
-
-    Распределение accuracy: параллельно ведётся ТОЧНАЯ гистограмма
-    (значение accuracy -> число моделей) по ВСЕМ валидным моделям
-    (AccuracyHistogram). accuracy - среднее долей k/n_test, поэтому
-    различных значений немного (обычно тысячи-сотни тысяч), и
-    гистограмма меньше, чем даже выборка "каждой 10-й модели"; если
-    различных значений всё же станет больше HIST_MAX_DISTINCT, они
-    огрубляются до HIST_COARSE_DECIMALS знаков. По ней для порога
-    top-N считается перцентильный ранг (доля моделей строго ниже порога,
-    с учётом половины ничьих, и не выше порога) и число ничьих на пороге.
-    Гистограмма и сводка пишутся рядом с .pkl:
-      month_<m>__n_features_<nf>__accuracy_distribution.tsv
-      selection_summary__<tag>.tsv
-
-  Phase 2 ("refit"): победители группируются по индексу комбинации
-    тестов, widetable перестраивается (по тому же seed - воспроизводимо)
-    ТОЛЬКО для комбинаций тестов, у которых есть хотя бы один
-    "победитель", и дообучение с финальной моделью (fit_combo_model())
-    выполняется ТОЛЬКО для наборов признаков, прошедших отбор. Каждая
-    финальная запись дописывается ПО ОДНОЙ в .pkl файл группы (см.
-    _dump_model_with_dataset) - формат .pkl не изменился.
-
-Пары (месяц, test_combo) внутри Phase 1 независимы, поэтому считаются
-параллельно (joblib, --n-jobs). Случайные окна "живых" пациентов берут
-seed из (random_state, месяц, n_features, номер комбинации), поэтому
-результат не зависит ни от --n-jobs, ни от порядка выполнения задач, и
-Phase 2 воспроизводит ТОЧНО ТЕ ЖЕ widetable, что и Phase 1.
-
-ХРАНЕНИЕ ДАТАСЕТОВ (важное отличие от предыдущей версии): раньше
-сбалансированный (1:1) датасет каждой top-K модели сохранялся отдельным
-.tsv файлом в отдельной папке. Теперь он хранится ВНУТРИ той же записи
-.pkl файла, где лежит сама модель и её accuracy (ключ
-"balanced_dataset_tsv" - TSV-текст; см. load_one_model_dataset()).
-"""
-
 import argparse
 import io
 import itertools
@@ -143,14 +12,7 @@ from tqdm import tqdm
 import numpy as np
 import pandas as pd
 
-import matplotlib
-# Неинтерактивный backend - ДО импорта pyplot, иначе на машинах без
-# дисплея plt.show()/savefig может ждать GUI и не отдать управление баш-сессии.
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-
 from joblib import Parallel, delayed
-from scipy import stats as sp_stats
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
@@ -159,6 +21,9 @@ RANDOM_STATE = 42
 TOP_MODE = "fraction"    # "fraction" или "count"
 TOP_FRACTION = 0.10      # используется при TOP_MODE="fraction"
 TOP_COUNT = 10_000
+
+CHUNK_MODELS = 100_000   # сколько моделей считается между обновлениями top-буфера
+BUFFER_FACTOR = 1.5      # запас буфера над ожидаемым размером top при --top-mode fraction
 
 TEST_SIZE = 0.2
 # Мин. число строк ПОСЛЕ балансировки 1:1. При меньшем размере accuracy
@@ -256,7 +121,7 @@ def add_global_percentiles(
 
     Считается ОДИН РАЗ для всего датасета (а не отдельно для каждой
     комбинации тестов и месяца, как раньше) - результат затем просто
-    агрегируется (last/mean/q25/median/q75 за окно) наравне с абсолютным
+    агрегируется (mean/q25/median/q75 за окно) наравне с абсолютным
     значением теста, см. feature_engineering().
 
     NaN в value_col (после timing() это, например, обнулённые измерения)
@@ -454,10 +319,7 @@ def fit_combo_accuracy_only(
 ) -> Optional[Tuple[float, float, Tuple[float, ...], int, int]]:
     """Balanced hold-out оценка ОДНОГО набора feature_cols - БЕЗ
     дообучения финальной модели на всех данных и БЕЗ возврата
-    сбалансированного датасета. Используется в Phase 1 ("lite") отбора
-    top_fraction моделей (см. build_top_models()) - там нужны только
-    числа (accuracy), а не сами модели/датафреймы, которые при большом
-    числе комбинаций заняли бы всю оперативную память.
+    сбалансированного датасета.
 
     Возвращает (accuracy, accuracy_std, accuracies, n_train, n_test) или
     None, если этот набор колонок непригоден (нет данных, < 2 классов,
@@ -686,15 +548,14 @@ def fit_combo_model(
     split_random_states: Sequence[int] = SPLIT_RANDOM_STATES,
     stat: Optional[Tuple[float, float, Tuple[float, ...], int, int]] = None,
 ) -> Optional[Tuple[ModelRecord, pd.DataFrame]]:
-    """Полная (Phase 2 / "победитель") версия оценки: делает то же самое,
+    """Полная версия оценки для отобранной модели: делает то же самое,
     что и fit_combo_accuracy_only(), а дополнительно дообучает финальную
     модель на ВСЕХ сбалансированных данных (без hold-out, для инференса)
     и возвращает сам сбалансированный датасет - вызывается ТОЛЬКО для
-    наборов колонок, уже прошедших порог top_fraction в Phase 1 (см.
-    build_top_models()).
+    наборов колонок, вошедших в top (см. build_top_models()).
 
-    stat - уже посчитанные в Phase 1 (accuracy, accuracy_std, accuracies,
-    n_train, n_test): тогда hold-out сплиты повторно не считаются.
+    stat - уже посчитанные при переборе (accuracy, accuracy_std,
+    accuracies, n_train, n_test): тогда hold-out сплиты повторно не считаются.
 
     Возвращает (ModelRecord, сбалансированный_датасет) или None.
     """
@@ -730,7 +591,7 @@ def fit_combo_model(
 
 
 # --------------------------------------------------------------------------
-# 4. Phase 1 ("lite"): accuracy-only перебор + потоковый отбор top-K
+# 4. Перебор: accuracy-only оценка комбинации + потоковый отбор top
 # --------------------------------------------------------------------------
 
 # Колонки сырого df, которые нужны препроцессингу. Воркерам отправляются
@@ -740,18 +601,18 @@ WORKER_COLS = [
     "test_result", "test_result_percentile", "target", "days_to_death",
 ]
 
-# Компактная lite-запись одной модели Phase 1 (вместо dict ~1-1.5 КБ -
-# ~130 байт). feature_cols не хранятся: они однозначно восстанавливаются
-# из (combo_index, set_index) - set_index это позиция набора статистик в
-# itertools.product(*кандидаты_по_тестам), см. _feature_cols_from_index().
-# accuracies - accuracy по каждому разбиению SPLIT_RANDOM_STATES (хвост -
-# NaN, если часть разбиений не удалась; фактическая длина - n_splits).
+# Компактная запись одной модели (~130 байт). feature_cols не хранятся: они
+# однозначно восстанавливаются из (combo_index, set_index) - set_index это
+# позиция набора статистик в itertools.product(*кандидаты_по_тестам), см.
+# _feature_cols_from_index(). accuracies - accuracy по каждому разбиению
+# SPLIT_RANDOM_STATES (хвост - NaN, если часть разбиений не удалась;
+# фактическая длина - n_splits).
 N_SPLITS_MAX = len(SPLIT_RANDOM_STATES)
 LITE_DTYPE = np.dtype([
     ("key", "f8"),            # accuracy, округлённая до ACC_KEY_DECIMALS (ключ ранжирования)
     ("combo_index", "i8"),
     ("set_index", "i8"),
-    ("accuracy", "f8"),       # точная средняя accuracy (как раньше)
+    ("accuracy", "f8"),       # точная средняя accuracy
     ("accuracy_std", "f8"),
     ("n_train", "i4"),
     ("n_test", "i4"),
@@ -783,7 +644,7 @@ def _feature_cols_from_index(
 
 
 def _combo_task_lite(
-    df_parts: List[pd.DataFrame],   # было: df_loc: pd.DataFrame
+    df_parts: List[pd.DataFrame],
     month: int,
     test_combo: Tuple[str, ...],
     combo_index: int,
@@ -794,19 +655,16 @@ def _combo_task_lite(
     window_days: int,
     min_key: float = -np.inf,
 ) -> Tuple[int, int, int, int, Tuple[np.ndarray, np.ndarray], np.ndarray]:
-    """Одна задача Phase 1 для joblib.
-
-    Препроцессинг и оценка моделей - без изменений (тот же
-    build_feature_table() и fit_feature_sets_accuracy_batched()).
-    Меняется только упаковка результата:
+    """Одна задача перебора для joblib: строит таблицу признаков комбинации
+    и оценивает accuracy всех наборов статистик.
 
       - n_valid    - число валидных моделей (stat is not None);
       - (vals, counts) - гистограмма accuracy-ключей ВСЕХ валидных моделей
                      комбинации (для распределения accuracy);
       - recs       - LITE_DTYPE-массив только тех моделей, чей ключ
-                     >= min_key (текущий порог StreamingTopK на момент
+                     >= min_key (текущий порог top-буфера на момент
                      отправки задачи; модели ниже порога уже не могут
-                     попасть в итоговый top-N, поэтому не пересылаются).
+                     попасть в итоговый top, поэтому не пересылаются).
     """
     df_loc = pd.concat(df_parts, ignore_index=True)
     empty_hist = (np.empty(0, dtype=np.float64), np.empty(0, dtype=np.int64))
@@ -867,79 +725,20 @@ def _combo_task_lite(
     return month, len(test_combo), n_tried, n_valid, hist, recs
 
 
-class StreamingTopK:
-    """Потоковый отбор top-K компактных lite-записей (LITE_DTYPE) с
-    ограниченной памятью - векторная замена heapq.
-
-    Полный порядок (лучшие первыми): key по убыванию, затем combo_index и
-    set_index по возрастанию - детерминированно при любом порядке прихода.
-
-    Инвариант: после каждого push() объединение kept+pending содержит
-    точный top-capacity по этому порядку среди всех записей, поданных до
-    сих пор. Отсюда: запись с key < threshold (key capacity-й лучшей записи
-    на момент последнего сжатия) уже не может попасть ни в какой top-k,
-    k <= capacity, и отбрасывается.
-
-    Память: kept (<= capacity) + pending (<= slack + одна пачка), при
-    сжатии - временная копия; итого до ~2.5*capacity записей.
-    """
-
-    def __init__(self, capacity: int, dtype: np.dtype = LITE_DTYPE, min_slack: int = 100_000):
-        self.capacity = max(1, int(capacity))
-        self.min_slack = int(min_slack)
-        self.threshold = -np.inf
-        self.peak_records = 0
-        self.n_compactions = 0
-        self._kept = np.empty(0, dtype=dtype)
-        self._pending: List[np.ndarray] = []
-        self._n_pending = 0
-
-    def set_capacity(self, capacity: int) -> None:
-        """Ёмкость может только уменьшаться (верхняя граница числа
-        победителей уточняется по ходу перебора)."""
-        self.capacity = max(1, min(self.capacity, int(capacity)))
-
-    def _slack(self) -> int:
-        return max(self.min_slack, self.capacity // 4)
-
-    @staticmethod
-    def _order(recs: np.ndarray) -> np.ndarray:
-        return np.lexsort((recs["set_index"], recs["combo_index"], -recs["key"]))
-
-    def push(self, recs: np.ndarray) -> None:
-        if recs.size == 0:
-            return
-        if self.threshold > -np.inf:
-            recs = recs[recs["key"] >= self.threshold]
-            if recs.size == 0:
-                return
-        self._pending.append(recs)
-        self._n_pending += recs.size
-        size = self._kept.size + self._n_pending
-        self.peak_records = max(self.peak_records, size)
-        if size > self.capacity + self._slack():
-            self._compact()
-
-    def _compact(self) -> None:
-        if self._pending:
-            allr = np.concatenate([self._kept] + self._pending)
-            self._pending = []
-            self._n_pending = 0
-        else:
-            allr = self._kept
-        if allr.size > self.capacity:
-            allr = allr[self._order(allr)[: self.capacity]]
-            self.threshold = float(allr["key"][-1])
-            self.n_compactions += 1
-        self._kept = allr
-
-    def result(self, k: int) -> np.ndarray:
-        """Точный top-k (k <= capacity), отсортированный от лучшей к худшей."""
-        if k > self.capacity:
-            raise ValueError(f"k={k} больше ёмкости буфера {self.capacity}: точный top-k не гарантирован")
-        self._compact()
-        kept = self._kept
-        return kept[self._order(kept)[:k]]
+def update_top(best: np.ndarray, new: np.ndarray, capacity: int) -> np.ndarray:
+    """Оставляет capacity лучших записей среди best + new за O(n):
+    записи с key выше порога берутся все, ничьи на пороге добираются
+    детерминированно по (combo_index, set_index). Порядок внутри
+    результата не определён."""
+    allr = np.concatenate([best, new])
+    if allr.size <= capacity:
+        return allr
+    pos = allr.size - capacity
+    kth = np.partition(allr["key"], pos)[pos]
+    above = allr[allr["key"] > kth]
+    ties = allr[allr["key"] == kth]
+    ties = ties[np.lexsort((ties["set_index"], ties["combo_index"]))][: capacity - above.size]
+    return np.concatenate([above, ties])
 
 
 class AccuracyHistogram:
@@ -1038,14 +837,12 @@ def _dump_model_with_dataset(out_f, record: ModelRecord, balanced_df: pd.DataFra
     файл группы (месяц, n_features) представляет собой не один большой
     список, а ПОСЛЕДОВАТЕЛЬНОСТЬ независимо запиклленных словарей (по
     одному на модель): это позволяет писать и читать победителей по
-    одному, не держа в памяти сразу всех сразу (важно, когда top_fraction
-    от гигантского числа моделей всё равно остаётся большим числом).
+    одному, не держа в памяти сразу всех сразу.
 
     Сбалансированный (1:1) датасет для этой конкретной модели хранится
-    ВНУТРИ той же записи как TSV-текст (df.to_csv(sep="\t")) - раньше он
-    писался отдельным .tsv файлом рядом с .pkl, теперь - здесь же, под
-    ключом "balanced_dataset_tsv" (см. load_one_model_dataset() для
-    обратного преобразования в pd.DataFrame)."""
+    ВНУТРИ той же записи как TSV-текст (df.to_csv(sep="\t")) под ключом
+    "balanced_dataset_tsv" (см. load_one_model_dataset() для обратного
+    преобразования в pd.DataFrame)."""
     pickle.dump(_plain_model_record(record, balanced_df), out_f)
 
 
@@ -1079,11 +876,11 @@ def _combo_task_refit(
     min_samples: int,
     window_days: int,
 ) -> Tuple[List[bytes], List[float]]:
-    """Одна задача Phase 2 для joblib: перестраивает widetable комбинации
-    (тем же seed, что и в Phase 1) и дообучает всех её "победителей" -
-    winners = [(feature_cols, stat из Phase 1)], сплиты заново не считаются.
-    Возвращает уже запиклленные записи (главный процесс только дописывает
-    их байты в .pkl - это эквивалентно pickle.dump по одной) и их accuracy."""
+    """Одна задача дообучения для joblib: перестраивает таблицу признаков
+    комбинации (тем же seed, что и при переборе) и дообучает всех её
+    победителей - winners = [(feature_cols, stat)], сплиты заново не
+    считаются. Возвращает уже запиклленные записи (главный процесс только
+    дописывает их байты в .pkl) и их accuracy."""
     df_loc = pd.concat(df_parts, ignore_index=True)
 
     rng = np.random.default_rng(seed)
@@ -1164,7 +961,7 @@ def load_one_model_dataset(record: dict) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------
-# 6. Двухфазный отбор top-N моделей на пару (месяц, n_features)
+# 6. Отбор top-N моделей на пару (месяц, n_features)
 # --------------------------------------------------------------------------
 
 def _winner_tasks(
@@ -1174,10 +971,10 @@ def _winner_tasks(
 ):
     """Группирует победителей (LITE_DTYPE) по combo_index и ЛЕНИВО отдаёт
     (combo_index, [(feature_cols, stat), ...]) - Python-объекты создаются
-    только для комбинации, которая сейчас отправляется в Phase 2.
+    только для комбинации, которая сейчас отправляется на дообучение.
     Внутри комбинации - от лучшей модели к худшей. stat - ровно тот же
     кортеж (accuracy, accuracy_std, accuracies, n_train, n_test), что
-    вернула fit_feature_sets_accuracy_batched() в Phase 1."""
+    вернула fit_feature_sets_accuracy_batched()."""
     order = np.lexsort((winners["set_index"], -winners["key"], winners["combo_index"]))
     w = winners[order]
     combo_ids, starts = np.unique(w["combo_index"], return_index=True)
@@ -1205,7 +1002,6 @@ def build_top_models(
     n_features_list: Sequence[int],
     candidate_tests: Sequence[str],
     out_dir: Path,
-    tmp_dir: Optional[Path] = None,
     top_mode: str = TOP_MODE,
     top_fraction: float = TOP_FRACTION,
     top_count: int = TOP_COUNT,
@@ -1213,33 +1009,19 @@ def build_top_models(
     random_state: int = RANDOM_STATE,
     min_samples: int = MIN_SAMPLES,
     window_days: int = WINDOW_DAYS,
+    chunk_models: int = CHUNK_MODELS,
     n_jobs: int = -1,
     verbose: bool = True,
 ) -> Tuple[Dict[Tuple[int, int], Path], Dict[Tuple[int, int], List[float]]]:
-    """Phase 1 (потоковый отбор top-N, см. StreamingTopK) + Phase 2
-    (дообучение победителей и запись .pkl). tmp_dir больше не нужен
-    (временных файлов нет) и оставлен только для совместимости вызова.
-
-    Кроме .pkl, для каждой группы пишется гистограмма распределения
-    accuracy, а в out_dir/selection_summary__<tag>.tsv - сводка: порог
-    accuracy отобранного top-N, его перцентильный ранг в распределении
-    accuracy всех валидных моделей, число ничьих на пороге и т.д.
-    """
 
     if top_mode not in ("count", "fraction"):
-        raise ValueError(
-            f"Неизвестный top_mode={top_mode!r}. "
-            f"Используйте 'count' или 'fraction'."
-        )
-
+        raise ValueError(f"Неизвестный top_mode={top_mode!r}. Используйте 'count' или 'fraction'.")
     if top_mode == "count" and top_count <= 0:
         raise ValueError("top_count должен быть > 0.")
-
     if top_mode == "fraction" and not (0 < top_fraction <= 1):
         raise ValueError("top_fraction должен быть в диапазоне (0, 1].")
 
     candidate_set = set(candidate_tests)
-
     by_test = {
         t: g[WORKER_COLS]
         for t, g in df_timed.groupby("test_type_code")
@@ -1253,99 +1035,85 @@ def build_top_models(
     accuracies_by_group: Dict[Tuple[int, int], List[float]] = {}
     summary_rows: List[dict] = []
 
-    n_stat_candidates = len(
-        test_feature_candidates("x", 0)
-    )
+    n_stat_candidates = len(test_feature_candidates("x", 0))
 
     for month in months_list:
         for nf in n_features_list:
 
-            combos = list(
-                itertools.combinations(candidate_tests, nf)
-            )
+            combos = list(itertools.combinations(candidate_tests, nf))
             n_sets = n_stat_candidates ** nf
-            # комбинаторное число моделей группы (10 random states внутри
-            # одной модели - НЕ отдельные модели): верхняя граница числа
-            # валидных моделей
             n_models_upper = len(combos) * n_sets
+            chunk_combos = max(1, chunk_models // n_sets)
 
             accuracies_by_group[(month, nf)] = []
-
-            if top_mode == "fraction":
-                capacity = max(1, math.ceil(top_fraction * n_models_upper))
-            else:
-                capacity = top_count
 
             if verbose:
                 print(
                     f"[месяц {month}] n_features={nf}: "
                     f"{len(candidate_tests)} тестов-кандидатов, "
-                    f"{len(combos)} комбинаций тестов x {n_sets} наборов "
-                    f"статистик = {n_models_upper} моделей (верхняя граница); "
-                    f"ёмкость буфера top-N: {capacity} "
-                    f"(Phase 1: только accuracy)"
+                    f"{len(combos)} комбинаций x {n_sets} наборов статистик = "
+                    f"{n_models_upper} моделей (верхняя граница)"
                 )
 
-            # ==============================================================
-            # Phase 1: потоковый отбор top-N + гистограмма accuracy
-            # ==============================================================
-
-            topk = StreamingTopK(capacity)
+            best = np.empty(0, dtype=LITE_DTYPE)
+            threshold = -np.inf
+            capacity = top_count if top_mode == "count" else 1
+            min_capacity = np.inf
+            peak_records = 0
             hist = AccuracyHistogram()
             n_valid_total = 0
             n_combos_done = 0
 
-            # Генератор читается joblib лениво (pre_dispatch), поэтому
-            # topk.threshold подставляется в КАЖДУЮ задачу на момент её
-            # отправки - воркер сам отбрасывает заведомо проигравшие модели.
-            jobs = (
-                delayed(_combo_task_lite)(
-                    [by_test[t] for t in combo],
-                    month,
-                    combo,
-                    i,
-                    np.random.SeedSequence(
-                        [random_state, month, nf, i]
-                    ),
-                    test_size,
-                    random_state,
-                    min_samples,
-                    window_days,
-                    topk.threshold,
-                )
-                for i, combo in enumerate(combos)
-            )
+            with Parallel(n_jobs=n_jobs, return_as="generator_unordered", max_nbytes=None) as parallel, \
+                    tqdm(total=len(combos), desc=f"Month {month}, n_features={nf}", unit="combo") as pbar:
 
-            parallel = Parallel(
-                n_jobs=n_jobs,
-                return_as="generator_unordered",
-                max_nbytes=None
-            )
+                for start in range(0, len(combos), chunk_combos):
+                    ids = range(start, min(start + chunk_combos, len(combos)))
 
-            for _m, _nf, _tried, n_valid, (h_vals, h_counts), recs in tqdm(
-                parallel(jobs),
-                total=len(combos),
-                desc=f"Month {month}, n_features={nf}",
-                unit="combo",
-            ):
-                n_valid_total += n_valid
-                n_combos_done += 1
-                hist.add(h_vals, h_counts)
+                    jobs = (
+                        delayed(_combo_task_lite)(
+                            [by_test[t] for t in combos[i]],
+                            month,
+                            combos[i],
+                            i,
+                            np.random.SeedSequence([random_state, month, nf, i]),
+                            test_size,
+                            random_state,
+                            min_samples,
+                            window_days,
+                            threshold,
+                        )
+                        for i in ids
+                    )
 
-                if top_mode == "fraction":
-                    # уточнённая верхняя граница числа победителей:
-                    # валидные уже + все ещё не посчитанные модели
-                    remaining = (len(combos) - n_combos_done) * n_sets
-                    topk.set_capacity(math.ceil(top_fraction * (n_valid_total + remaining)))
+                    chunk_recs = []
+                    for _m, _nf, _tried, n_valid, (h_vals, h_counts), recs in parallel(jobs):
+                        n_valid_total += n_valid
+                        hist.add(h_vals, h_counts)
+                        chunk_recs.append(recs)
+                        pbar.update(1)
+                    n_combos_done += len(ids)
 
-                topk.push(recs)
+                    if top_mode == "fraction":
+                        remaining = (len(combos) - n_combos_done) * n_sets
+                        est_total = n_valid_total / (n_combos_done * n_sets) * n_models_upper
+                        capacity = max(1, min(
+                            math.ceil(BUFFER_FACTOR * top_fraction * est_total),
+                            math.ceil(top_fraction * (n_valid_total + remaining)),
+                        ))
+                    min_capacity = min(min_capacity, capacity)
+
+                    new = np.concatenate(chunk_recs)
+                    peak_records = max(peak_records, best.size + new.size)
+                    best = update_top(best, new, capacity)
+                    if best.size >= capacity:
+                        threshold = float(best["key"].min())
 
             if n_valid_total == 0:
                 if verbose:
                     print(
-                        f"  [месяц {month}] ни одной валидной "
-                        f"комбинации для n_features={nf} не найдено "
-                        f"(проверьте min_samples / плотность измерений)"
+                        f"  [месяц {month}] ни одной валидной комбинации для "
+                        f"n_features={nf} не найдено (проверьте min_samples / плотность измерений)"
                     )
                 continue
 
@@ -1353,14 +1121,22 @@ def build_top_models(
                 n_select = max(1, int(round(n_valid_total * top_fraction)))
             else:
                 n_select = min(top_count, n_valid_total)
+            n_select = min(n_select, best.size)
 
-            winners = topk.result(n_select)
-            assert len(winners) == n_select, (len(winners), n_select)
+            if n_select > min_capacity:
+                print(
+                    f"  ВНИМАНИЕ [месяц {month}, n_features={nf}]: ёмкость буфера опускалась до "
+                    f"{min_capacity:.0f} < {n_select} - top может быть неточным, "
+                    f"увеличьте BUFFER_FACTOR или CHUNK_MODELS"
+                )
 
-            threshold = float(winners["key"][-1])
-            rank = hist.rank_of(threshold)
+            order = np.lexsort((best["set_index"], best["combo_index"], -best["key"]))
+            winners = best[order[:n_select]]
+
+            threshold_acc = float(winners["key"][-1])
+            rank = hist.rank_of(threshold_acc)
             h_values, h_counts = hist.finalize()
-            n_tied_selected = int((winners["key"] == round(threshold, ACC_KEY_DECIMALS)).sum())
+            n_tied_selected = int((winners["key"] == round(threshold_acc, ACC_KEY_DECIMALS)).sum())
 
             dist_path = out_dir / f"month_{month}__n_features_{nf}__accuracy_distribution.tsv"
             pd.DataFrame({"accuracy": h_values, "n_models": h_counts}).to_csv(
@@ -1377,7 +1153,7 @@ def build_top_models(
                 "n_valid_models": n_valid_total,
                 "n_selected": n_select,
                 "selected_share_pct": 100.0 * n_select / n_valid_total,
-                "accuracy_threshold": threshold,
+                "accuracy_threshold": threshold_acc,
                 "accuracy_best": float(winners["key"][0]),
                 "accuracy_median_all": float(h_values[np.searchsorted(np.cumsum(h_counts), (hist.total + 1) // 2)]),
                 "n_models_below_threshold": rank["n_below"],
@@ -1388,46 +1164,23 @@ def build_top_models(
                 "pct_rank_weak": rank["pct_rank_weak"],
                 "hist_distinct_values": int(h_values.size),
                 "hist_decimals": hist.decimals,
-                "buffer_peak_records": topk.peak_records,
-                "buffer_peak_mb": topk.peak_records * LITE_DTYPE.itemsize / 2**20,
+                "buffer_peak_records": peak_records,
+                "buffer_peak_mb": peak_records * LITE_DTYPE.itemsize / 2**20,
             })
 
             if verbose:
                 print(
-                    f"  [месяц {month}] n_features={nf}: валидных моделей: "
-                    f"{n_valid_total}, отобрано {n_select} "
-                    f"({100.0 * n_select / n_valid_total:.2f}%); "
-                    f"порог accuracy = {threshold:.6f} "
-                    f"(лучшая {float(winners['key'][0]):.6f}); "
-                    f"перцентильный ранг порога: {rank['pct_rank_mean']:.2f} "
-                    f"[строго ниже {rank['pct_rank_strict']:.2f}, "
-                    f"не выше {rank['pct_rank_weak']:.2f}]; "
-                    f"ничьих на пороге: {rank['n_tied']} "
-                    f"(из них отобрано {n_tied_selected}); "
-                    f"пик буфера: {topk.peak_records} записей "
-                    f"(~{topk.peak_records * LITE_DTYPE.itemsize / 2**20:.1f} МБ)"
+                    f"  [месяц {month}] n_features={nf}: валидных моделей: {n_valid_total}, "
+                    f"отобрано {n_select} ({100.0 * n_select / n_valid_total:.2f}%); "
+                    f"порог accuracy = {threshold_acc:.6f} (лучшая {float(winners['key'][0]):.6f}); "
+                    f"перцентильный ранг порога: {rank['pct_rank_mean']:.2f}; "
+                    f"пик буфера: ~{peak_records * LITE_DTYPE.itemsize / 2**20:.1f} МБ"
                 )
 
-            # ==============================================================
-            # Phase 2 - без изменений: дообучение победителей, запись .pkl
-            # ==============================================================
-
+            # Дообучение только отобранных моделей и запись .pkl
             n_winner_combos = int(np.unique(winners["combo_index"]).size)
-            n_winners = len(winners)
-
-            out_path = (
-                out_dir
-                / (
-                    f"month_{month}"
-                    f"__n_features_{nf}"
-                    f"__{tag}"
-                    f".pkl"
-                )
-            )
-
+            out_path = out_dir / f"month_{month}__n_features_{nf}__{tag}.pkl"
             output_paths[(month, nf)] = out_path
-
-            n_saved = 0
 
             refit_jobs = (
                 delayed(_combo_task_refit)(
@@ -1435,58 +1188,41 @@ def build_top_models(
                     month,
                     combos[combo_index],
                     combo_winners,
-                    np.random.SeedSequence(
-                        [random_state, month, nf, combo_index]
-                    ),
+                    np.random.SeedSequence([random_state, month, nf, combo_index]),
                     test_size,
                     random_state,
                     min_samples,
                     window_days,
                 )
-                for combo_index, combo_winners in _winner_tasks(
-                    winners, combos, window_days * month
-                )
+                for combo_index, combo_winners in _winner_tasks(winners, combos, window_days * month)
             )
 
-            # "generator" (упорядоченный) - чтобы порядок записей в .pkl
-            # не зависел от --n-jobs
-            refit_parallel = Parallel(
-                n_jobs=n_jobs,
-                return_as="generator",
-                max_nbytes=None
-            )
-
+            n_saved = 0
             with open(out_path, "wb") as out_f:
-
                 for blobs, accs in tqdm(
-                    refit_parallel(refit_jobs),
+                    Parallel(n_jobs=n_jobs, return_as="generator", max_nbytes=None)(refit_jobs),
                     total=n_winner_combos,
-                    desc=f"Month {month}, n_features={nf} (Phase 2)",
+                    desc=f"Month {month}, n_features={nf} (save)",
                     unit="combo",
                 ):
-
                     for blob in blobs:
                         out_f.write(blob)
-
                     accuracies_by_group[(month, nf)].extend(accs)
                     n_saved += len(blobs)
 
-            del winners, topk
+            del winners, best
 
             if verbose:
-                print(
-                    f"  [месяц {month}] n_features={nf}: "
-                    f"победителей найдено {n_winners}, "
-                    f"сохранено моделей: {n_saved} -> {out_path}"
-                )
+                print(f"  [месяц {month}] n_features={nf}: сохранено моделей: {n_saved} -> {out_path}")
 
     if summary_rows:
         summary_path = out_dir / f"selection_summary__{tag}.tsv"
         pd.DataFrame(summary_rows).to_csv(summary_path, sep="\t", index=False)
         if verbose:
-            print(f"Сводка отбора (порог, перцентильный ранг, ничьи): {summary_path}")
+            print(f"Сводка отбора: {summary_path}")
 
     return output_paths, accuracies_by_group
+
 
 # --------------------------------------------------------------------------
 # main
@@ -1496,8 +1232,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Поиск логрегрессий по комбинациям лабораторных тестов на СЫРОМ "
                      "(длинном) датасете; глобальные перцентили считаются один раз на "
-                     "исходной длинной таблице, отбор моделей - top_fraction (не top-K), "
-                     "датасеты хранятся внутри .pkl вместе с моделью и accuracy."
+                     "исходной длинной таблице, отбор моделей - потоковый top (доля или "
+                     "число), датасеты хранятся внутри .pkl вместе с моделью и accuracy."
     )
     parser.add_argument("--data-path", required=True, help="Путь к сырому .tsv/.csv файлу с измерениями")
     parser.add_argument("--target-col", default="target")
@@ -1516,20 +1252,20 @@ def main():
         help="Режим отбора: count = фиксированное число лучших моделей; "
             "fraction = доля лучших моделей."
     )
-
     parser.add_argument(
         "--top-count",
         type=int,
         default=TOP_COUNT,
         help="Число лучших моделей при --top-mode count."
     )
-
     parser.add_argument(
         "--top-fraction",
         type=float,
         default=TOP_FRACTION,
         help="Доля лучших моделей при --top-mode fraction."
     )
+    parser.add_argument("--chunk-models", type=int, default=CHUNK_MODELS,
+                         help="Сколько моделей считать между обновлениями top-буфера")
     parser.add_argument("--test-size", type=float, default=TEST_SIZE)
     parser.add_argument("--min-samples", type=int, default=MIN_SAMPLES,
                          help="Мин. число строк ПОСЛЕ балансировки 1:1, чтобы комбинация считалась валидной")
@@ -1539,9 +1275,6 @@ def main():
     parser.add_argument("--n-jobs", type=int, default=-1,
                          help="Число параллельных процессов joblib (-1 = все ядра, 1 = без параллелизма)")
     parser.add_argument("--output-dir", default="output")
-    parser.add_argument("--tmp-dir", default=None,
-                         help="Не используется (временных файлов больше нет); оставлен "
-                              "для совместимости командной строки")
     args = parser.parse_args()
 
     # dict.fromkeys - убрать повторы ("1,1"), сохранив порядок: иначе одни и
@@ -1581,6 +1314,7 @@ def main():
         random_state=args.random_state,
         min_samples=args.min_samples,
         window_days=args.window_days,
+        chunk_models=args.chunk_models,
         n_jobs=args.n_jobs,
     )
 
@@ -1589,10 +1323,7 @@ def main():
         print(f"  Готово: {path} ({n_models} моделей; accuracy и сбалансированный "
               f"датасет каждой модели хранятся вместе, внутри этого .pkl)")
 
-
     print("\nГотово.")
-    # Явный выход с кодом 0 - гарантирует, что процесс (и вызвавшая его
-    # баш-сессия) завершится сразу после окончания работы.
     sys.exit(0)
 
 
